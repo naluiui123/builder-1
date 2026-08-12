@@ -1,0 +1,85 @@
+name: migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID'
+        required: true
+      source_url:
+        description: 'Signed source URL'
+        required: true
+      source_root:
+        description: 'Project root inside zip'
+        required: false
+        default: '.'
+      target_flutter:
+        description: 'Target Flutter version'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter target
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ github.event.inputs.target_flutter }}
+
+      - name: Download source
+        run: |
+          curl -sL -o project.zip "${{ github.event.inputs.source_url }}"
+          mkdir -p workspace
+          unzip -q -o project.zip -d workspace
+          rm -f project.zip
+
+      - name: Locate project root
+        id: root
+        run: |
+          ROOT="${{ github.event.inputs.source_root }}"
+          if [ "$ROOT" = "." ]; then
+            DIR=$(find workspace -name pubspec.yaml -maxdepth 3 -print -quit | xargs -d '\n' dirname)
+            if [ -z "$DIR" ]; then
+              echo "::error::pubspec.yaml tidak ditemukan di dalam source zip."
+              exit 1
+            fi
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=workspace/$ROOT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Structured migration
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          # Structured updates: environment sdk constraints hanya bila aman.
+          sed -i -E 's/sdk: ">=?[0-9.]+ <[0-9.]+"/sdk: ">=2.17.0 <4.0.0"/' pubspec.yaml 2>/dev/null || true
+          sed -i -E 's/sdk: [0-9.]+/sdk: ">=2.17.0 <4.0.0"/' pubspec.yaml 2>/dev/null || true
+          flutter pub get
+
+      - name: Analyze after migration
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: flutter analyze --no-pub 2>&1 | tee migration-analyze.txt || true
+
+      - name: Re-zip migrated project
+        run: |
+          cd workspace
+          zip -q -r ../migrated.zip .
+          cd ..
+
+      - name: Upload migrated source
+        uses: actions/upload-artifact@v4
+        with:
+          name: migrated-source
+          path: migrated.zip
+          if-no-files-found: ignore
+          retention-days: 7

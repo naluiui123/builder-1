@@ -1,0 +1,92 @@
+name: analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID'
+        required: true
+      source_url:
+        description: 'Signed source URL'
+        required: true
+      source_root:
+        description: 'Project root inside zip'
+        required: false
+        default: '.'
+      flutter_version:
+        description: 'Flutter version'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download source
+        run: |
+          curl -sL -o project.zip "${{ github.event.inputs.source_url }}"
+          ls -la project.zip
+
+      - name: Extract
+        run: |
+          sudo apt-get install -y unzip > /dev/null
+          mkdir -p workspace
+          unzip -q -o project.zip -d workspace
+          rm -f project.zip
+
+      - name: Locate project root
+        id: root
+        run: |
+          ROOT="${{ github.event.inputs.source_root }}"
+          if [ "$ROOT" = "." ]; then
+            DIR=$(find workspace -name pubspec.yaml -maxdepth 3 -print -quit | xargs -d '\n' dirname)
+            if [ -z "$DIR" ]; then
+              echo "::error::pubspec.yaml tidak ditemukan di dalam source zip."
+              exit 1
+            fi
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=workspace/$ROOT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide Flutter version (compat)
+        id: compat
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          FV="${{ github.event.inputs.flutter_version }}"
+          if [ -n "$FV" ]; then
+            echo "flutter=$FV" >> "$GITHUB_OUTPUT"
+          elif grep -qE 'font_awesome_flutter:[[:space:]]*"?(\^10\.|10\.|>=10[^0-9])' pubspec.yaml; then
+            echo "::warning::font_awesome_flutter <11 butuh Flutter <3.44; memakai Flutter 3.35.3."
+            echo "flutter=3.35.3" >> "$GITHUB_OUTPUT"
+          else
+            echo "flutter=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.compat.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Analyze
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          chmod -R u+w . 2>/dev/null || true
+          rm -rf .dart_tool .packages
+          flutter pub get
+          flutter analyze --no-pub 2>&1 | tee analyze.txt || true
+          echo "Analyze output tersimpan."
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis
+          path: ${{ steps.root.outputs.dir }}/analyze.txt
+          if-no-files-found: ignore
+          retention-days: 7

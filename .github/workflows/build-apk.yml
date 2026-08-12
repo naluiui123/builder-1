@@ -1,0 +1,387 @@
+name: build-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID'
+        required: true
+      source_url:
+        description: 'Signed source URL'
+        required: true
+      source_root:
+        description: 'Project root inside zip'
+        required: false
+        default: '.'
+      build_type:
+        description: 'apk | aab | both'
+        required: false
+        default: 'apk'
+      flutter_version:
+        description: 'Flutter version'
+        required: false
+        default: ''
+      java_version:
+        description: 'Java version'
+        required: false
+        default: '17'
+      screen_explore:
+        description: 'Ambil screenshot otomatis setelah build (true/false)'
+        required: false
+        default: 'false'
+      apk_upload_url:
+        description: 'Signed upload URL langsung ke storage (opsional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space
+        run: |
+          sudo apt-get clean
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/local/share/swift
+          df -h
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ github.event.inputs.java_version }}
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ runner.os }}-${{ github.event.inputs.flutter_version || 'stable' }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ github.event.inputs.flutter_version || 'stable' }}-
+            gradle-${{ runner.os }}-
+
+      - name: Download source
+        run: |
+          curl -sL -o project.zip "${{ github.event.inputs.source_url }}"
+          ls -la project.zip
+
+      - name: Extract
+        run: |
+          sudo apt-get install -y unzip > /dev/null
+          mkdir -p workspace
+          unzip -q -o project.zip -d workspace
+          rm -f project.zip
+
+      - name: Locate project root
+        id: root
+        run: |
+          ROOT="${{ github.event.inputs.source_root }}"
+          if [ "$ROOT" = "." ]; then
+            DIR=$(find workspace -name pubspec.yaml -maxdepth 3 -print -quit | xargs -d '\n' dirname)
+            if [ -z "$DIR" ]; then
+              echo "::error::pubspec.yaml tidak ditemukan di dalam source zip."
+              exit 1
+            fi
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=workspace/$ROOT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide Flutter version (compat)
+        id: compat
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          FV="${{ github.event.inputs.flutter_version }}"
+          if [ -n "$FV" ]; then
+            echo "flutter=$FV" >> "$GITHUB_OUTPUT"
+          elif grep -qE 'font_awesome_flutter:[[:space:]]*"?(\^10\.|10\.|>=10[^0-9])' pubspec.yaml; then
+            echo "::warning::font_awesome_flutter <11 butuh Flutter <3.44; memakai Flutter 3.35.3."
+            echo "flutter=3.35.3" >> "$GITHUB_OUTPUT"
+          else
+            echo "flutter=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.compat.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Scaffold platform folders (auto, non-destructive)
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          if [ ! -d android ]; then
+            echo "android/ tidak ditemukan -> membuat scaffold Flutter (lib/main.dart & pubspec.yaml tidak ditimpa)."
+            flutter create --project-name webview_app --platforms android,ios,web .
+          else
+            echo "android/ sudah ada -> melewati scaffold."
+          fi
+
+      - name: Apply webview metadata (label, package, permissions)
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          GRADLE=android/app/build.gradle
+          if [ -f "$MANIFEST" ]; then
+            grep -q 'android.permission.INTERNET' "$MANIFEST" || sed -i 's|</manifest>|    <uses-permission android:name="android.permission.INTERNET"/>\n</manifest>|' "$MANIFEST"
+            if [ -f webview_label.txt ]; then
+              LABEL=$(head -c 60 webview_label.txt | tr -d '\n')
+              sed -i "s|android:label=\"[^\"]*\"|android:label=\"$LABEL\"|" "$MANIFEST"
+            fi
+            if [ -f webview_package.txt ]; then
+              PKG=$(tr -d '\r\n' < webview_package.txt | sed 's/[^a-zA-Z0-9._]//g')
+              if [ -n "$PKG" ]; then
+                if [ -f "$GRADLE" ]; then
+                  sed -i "s|applicationId \"[^\"]*\"|applicationId \"$PKG\"|" "$GRADLE"
+                  sed -i "s|namespace \"[^\"]*\"|namespace \"$PKG\"|" "$GRADLE"
+                fi
+                if [ -f android/app/build.gradle.kts ]; then
+                  sed -i "s|applicationId = \"[^\"]*\"|applicationId = \"$PKG\"|" android/app/build.gradle.kts
+                  sed -i "s|namespace = \"[^\"]*\"|namespace = \"$PKG\"|" android/app/build.gradle.kts
+                fi
+              fi
+            fi
+            if [ -f webview_icon.png ]; then
+              echo "webview_icon.png ditemukan -> mengganti launcher icon."
+              for d in android/app/src/main/res/mipmap-*dpi; do
+                [ -d "$d" ] && cp webview_icon.png "$d/ic_launcher.png"
+                [ -d "$d" ] && cp webview_icon.png "$d/ic_launcher_round.png"
+              done
+              rm -rf android/app/src/main/res/mipmap-anydpi-v26
+            fi
+          fi
+
+      - name: Fix Gradle Wrapper URL (avoid GitHub Releases 503)
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          PROP="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROP" ]; then
+            echo "Memperbaiki Gradle Wrapper URL di $PROP..."
+            sed -i 's|github.com/gradle/gradle-distributions/releases/download|services.gradle.org/distributions|g' "$PROP"
+            cat "$PROP"
+          fi
+
+      - name: Prepare Android SDK components
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          cat android/app/build.gradle 2>/dev/null | grep -E 'compileSdk|minSdk|targetSdk' || true
+
+      - name: Pub get
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          chmod -R u+w . 2>/dev/null || true
+          rm -rf .dart_tool .packages build
+          flutter pub get
+
+      - name: Fix compileSdk (plugin butuh Android SDK 36+)
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            echo "Menyesuaikan compileSdk di $f -> 36 (plugin terbaru butuh SDK 36+)."
+            sed -i -E 's/compileSdkVersion[[:space:]]+[0-9]+/compileSdkVersion 36/g; s/compileSdk[[:space:]]*=*[[:space:]]*[0-9]+/compileSdk = 36/g' "$f"
+            grep -E 'compileSdk' "$f" || true
+          done
+
+      - name: Build APK
+        working-directory: ${{ steps.root.outputs.dir }}
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: ${{ steps.root.outputs.dir }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload APK (direct ke storage)
+        if: ${{ github.event.inputs.apk_upload_url != '' }}
+        shell: bash
+        run: |
+          APK=$(find "${{ steps.root.outputs.dir }}/build/app/outputs/flutter-apk" -name '*.apk' | head -1)
+          test -n "$APK" || { echo "::error::APK tidak ditemukan untuk direct upload."; exit 1; }
+          curl -sS -f --max-time 600 -X PUT -H "x-upsert: true" --data-binary "@$APK" "${{ github.event.inputs.apk_upload_url }}" || {
+            echo "::warning::Direct upload APK gagal — memakai fallback unduhan GitHub."
+            exit 0
+          }
+
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    needs: build
+    if: ${{ github.event.inputs.screen_explore == 'true' }}
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: apk
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Diagnose KVM
+        run: |
+          echo "--- /dev/kvm ---"
+          ls -la /dev/kvm 2>&1 || true
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+            echo "KVM_OK=yes"
+          else
+            echo "KVM_OK=no"
+            echo "::warning::KVM tetap tidak tersedia — emulator akan lambat (software) dan mungkin gagal boot."
+          fi
+
+      - name: Prepare screen explorer script
+        run: |
+          cat > explore.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -e
+          APK=$(find apk -name '*.apk' | head -1)
+          echo "APK=$APK"
+          [ -n "$APK" ] || { echo "::error::APK tidak ditemukan."; exit 1; }
+          MAX_SCREENSHOTS=20
+          MAX_ACTIONS=60
+          MAX_DEPTH=3
+
+          adb install "$APK"
+
+          PACKAGE=$(adb shell pm list packages -3 2>/dev/null | head -1 | sed 's/^package://' | tr -d '\r')
+          if [ -z "$PACKAGE" ]; then
+            echo "::error::Tidak ada package third-party setelah install."
+            exit 1
+          fi
+          echo "package=$PACKAGE"
+
+          launch() {
+            adb shell monkey -p "$PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+            sleep 8
+          }
+
+          ensure_app() {
+            local act
+            act=$(adb shell dumpsys activity top 2>/dev/null | grep 'ACTIVITY' | head -1 | awk '{print $2}' | tr -d '\r')
+            case "$act" in *"$PACKAGE"*) ;; *) echo "app exited -> relaunch"; launch ;; esac
+          }
+
+          state() {
+            local act ui
+            act=$(adb shell dumpsys activity top 2>/dev/null | grep 'ACTIVITY' | head -1 | awk '{print $2}' | tr -d '\r')
+            ui=$(adb shell uiautomator dump /data/local/tmp/ui.xml >/dev/null 2>&1; adb shell cat /data/local/tmp/ui.xml 2>/dev/null | sed -E 's/timestamp="[^"]*"//g' | tr -d '\0' | md5sum | cut -d' ' -f1)
+            echo "${act}|${ui}"
+          }
+
+          snapshot() {
+            adb exec-out screencap -p > "screenshot-$SCREENS.png"
+            echo "  saved screenshot-$SCREENS.png"
+          }
+
+          seen() {
+            case " $SEEN " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+          }
+
+          get_centers() {
+            adb shell uiautomator dump /data/local/tmp/ui.xml >/dev/null 2>&1
+            adb shell cat /data/local/tmp/ui.xml 2>/dev/null | sed 's/></>\n</g' | while IFS= read -r node; do
+              case "$node" in
+                *'clickable="true"'*)
+                  b=$(printf '%s' "$node" | sed -nE 's/.*bounds="\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]".*/\1 \2 \3 \4/p')
+                  if [ -n "$b" ]; then
+                    x1=$(printf '%s' "$b" | awk '{print $1}'); y1=$(printf '%s' "$b" | awk '{print $2}')
+                    x2=$(printf '%s' "$b" | awk '{print $3}'); y2=$(printf '%s' "$b" | awk '{print $4}')
+                    cx=$(((x1+x2)/2)); cy=$(((y1+y2)/2))
+                    if [ "$cy" -gt 40 ] && [ "$cy" -lt 600 ]; then
+                      echo "$cx $cy"
+                    fi
+                  fi
+                  ;;
+              esac
+            done | sort -u -k2,2n
+          }
+
+          launch
+          SCREENS=1
+          ACTIONS=0
+          DEPTH=0
+          SEEN=" $(state) "
+          snapshot
+          echo "captured: initial"
+
+          for g in "swipe 280 320 40 320 300" "swipe 40 320 280 320 300" "swipe 160 540 160 100 300"; do
+            [ "$SCREENS" -ge "$MAX_SCREENSHOTS" ] && break
+            [ "$ACTIONS" -ge "$MAX_ACTIONS" ] && break
+            adb shell input $g >/dev/null 2>&1 || true
+            ACTIONS=$((ACTIONS+1))
+            sleep 3
+            s=$(state)
+            if ! seen "$s"; then
+              SEEN="$SEEN $s "
+              SCREENS=$((SCREENS+1)); snapshot
+              echo "captured: gesture ($g)"
+            fi
+          done
+          ensure_app
+
+          explore() {
+            local centers c before after
+            centers=$(get_centers)
+            for c in $centers; do
+              [ "$SCREENS" -ge "$MAX_SCREENSHOTS" ] && return
+              [ "$ACTIONS" -ge "$MAX_ACTIONS" ] && return
+              before=$(state)
+              adb shell input tap $c >/dev/null 2>&1 || true
+              ACTIONS=$((ACTIONS+1))
+              sleep 2
+              after=$(state)
+              if [ "$after" != "$before" ] && ! seen "$after"; then
+                SEEN="$SEEN $after "
+                SCREENS=$((SCREENS+1)); snapshot
+                echo "captured: tap ($c)"
+                if [ "$DEPTH" -lt "$MAX_DEPTH" ]; then
+                  DEPTH=$((DEPTH+1))
+                  explore
+                  DEPTH=$((DEPTH-1))
+                fi
+              else
+                echo "same/visited: tap ($c)"
+              fi
+              adb shell input keyevent 4 >/dev/null 2>&1 || true
+              sleep 2
+              ensure_app
+            done
+          }
+
+          explore
+
+          adb shell dumpsys activity activities | grep -oE 'mCurrentFocus=.*' | head -1 > current-activity.txt || true
+          echo "done: $((SCREENS-1)) screenshots, $ACTIONS actions"
+          SCRIPT
+          chmod +x explore.sh
+
+      - name: Run emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            bash explore.sh
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshot-*.png
+          if-no-files-found: ignore
+          retention-days: 7
